@@ -70,6 +70,21 @@ err = log.TruncateBack(950)
 
 
 
+## Crash recovery
+
+A power loss or crash can leave a partially written record at the end of the
+tail segment. On `Open`, the log scans each segment sequentially:
+
+- A torn (incomplete) trailing record in the **tail segment** is truncated
+  away, all preceding intact entries are kept, and the log opens normally.
+- Corruption anywhere else, including a damaged interior record or any
+  problem in a non-tail segment, returns `ErrCorrupt`. Entries are never
+  silently skipped.
+- Every recovery truncation is recorded on disk: the discarded bytes are
+  written to a `<segment>.CORRUPT` sidecar file next to the segment (numbered
+  `.CORRUPT.1`, `.CORRUPT.2`, ... if one already exists), so the truncation
+  leaves an auditable trace instead of dropping data silently.
+
 ## Contact
 
 Josh Baker [@tidwall](http://twitter.com/tidwall)

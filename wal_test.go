@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -615,7 +616,7 @@ func TestOutliers(t *testing.T) {
 		l.Close()
 	})
 
-	t.Run("fail-corrupted-tail-json", func(t *testing.T) {
+	t.Run("corrupted-tail-json", func(t *testing.T) {
 		defer os.RemoveAll("testlog/corrupt-tail")
 		opts := makeOpts(512, true, JSON, false)
 		os.MkdirAll("testlog/corrupt-tail", 0777)
@@ -640,12 +641,64 @@ func TestOutliers(t *testing.T) {
 			l.Close()
 			t.Fatalf("expected %v, got %v", ErrCorrupt, err)
 		}
+		// A torn final line (no newline terminator) after intact records must
+		// be truncated away so the log still opens and keeps the valid prefix.
+		valid := []byte(`{"index":"1","data":"+hello"}` + "\n")
+		torn := []byte(`{"index":"2","data":"+partial`)
 		ioutil.WriteFile(
 			"testlog/corrupt-tail/00000000000000000001",
-			[]byte(`{"index":"1","data":"?"}`), 0666)
-		if l, err := Open("testlog/corrupt-tail", opts); err != ErrCorrupt {
-			l.Close()
-			t.Fatalf("expected %v, got %v", ErrCorrupt, err)
+			append(append([]byte{}, valid...), torn...), 0666)
+		l, err := Open("testlog/corrupt-tail", opts)
+		if err != nil {
+			t.Fatalf("expected recovery, got %v", err)
+		}
+		if fi, _ := l.FirstIndex(); fi != 1 {
+			t.Fatalf("expected first index 1, got %d", fi)
+		}
+		if li, _ := l.LastIndex(); li != 1 {
+			t.Fatalf("expected last index 1, got %d", li)
+		}
+		data, err := l.Read(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "hello" {
+			t.Fatalf("expected hello, got %s", data)
+		}
+		// The truncation must leave a trace containing the torn bytes.
+		trace, err := ioutil.ReadFile(
+			"testlog/corrupt-tail/00000000000000000001.CORRUPT")
+		if err != nil {
+			t.Fatalf("expected corrupt trace file: %v", err)
+		}
+		if !bytes.Equal(trace, torn) {
+			t.Fatalf("trace mismatch: %q != %q", trace, torn)
+		}
+		// The on-disk segment must be physically truncated to the valid prefix.
+		seg, err := ioutil.ReadFile("testlog/corrupt-tail/00000000000000000001")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(seg, valid) {
+			t.Fatalf("segment mismatch: %q != %q", seg, valid)
+		}
+		// Appending continues from the last intact index.
+		if err := l.Write(2, []byte("world")); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Close(); err != nil {
+			t.Fatal(err)
+		}
+		l, err = Open("testlog/corrupt-tail", opts)
+		if err != nil {
+			t.Fatalf("reopen failed: %v", err)
+		}
+		defer l.Close()
+		if li, _ := l.LastIndex(); li != 2 {
+			t.Fatalf("expected last index 2, got %d", li)
+		}
+		if data, err = l.Read(2); err != nil || string(data) != "world" {
+			t.Fatalf("expected world, got %q (%v)", data, err)
 		}
 	})
 
@@ -676,6 +729,267 @@ func makeOpts(segSize int, noSync bool, lf LogFormat, allowEmpty bool,
 	opts.LogFormat = lf
 	opts.AllowEmpty = allowEmpty
 	return &opts
+}
+
+func TestTailTornRecordRecovery(t *testing.T) {
+	for _, lf := range []LogFormat{Binary, JSON} {
+		name := "binary"
+		if lf == JSON {
+			name = "json"
+		}
+		t.Run(name, func(t *testing.T) {
+			logPath := "testlog/torn-tail-" + name
+			os.RemoveAll(logPath)
+			defer os.RemoveAll(logPath)
+			opts := makeOpts(4096, true, lf, false)
+			l, err := Open(logPath, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const n = 50
+			for i := uint64(1); i <= n; i++ {
+				if err := l.Write(i, []byte(dataStr(i))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			segPath := l.segments[len(l.segments)-1].path
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+			seg, err := ioutil.ReadFile(segPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Simulate a power loss mid-write: the final record only made it
+			// halfway to disk.
+			cut := len(seg) - len(seg)/4
+			torn := seg[cut:]
+			if err := ioutil.WriteFile(segPath, seg[:cut], 0666); err != nil {
+				t.Fatal(err)
+			}
+			l, err = Open(logPath, opts)
+			if err != nil {
+				t.Fatalf("log with torn tail failed to open: %v", err)
+			}
+			// Recompute the expected torn suffix from the recovered boundary:
+			// the cut may land in the middle of any record, and every byte at
+			// or after that boundary is quarantined.
+			last, err := l.LastIndex()
+			if err != nil {
+				t.Fatal(err)
+			}
+			recoveredSeg := l.segments[len(l.segments)-1]
+			if len(recoveredSeg.epos) == 0 {
+				t.Fatal("expected at least one recovered entry")
+			}
+			validLen := recoveredSeg.epos[len(recoveredSeg.epos)-1].end
+			torn = seg[:cut][validLen:]
+			if last < 1 || last > n {
+				t.Fatalf("recovered last index %d outside [1,%d]", last, n)
+			}
+			// Every recovered entry up to the truncation point stays intact.
+			for i := uint64(1); i <= last; i++ {
+				data, err := l.Read(i)
+				if err != nil {
+					t.Fatalf("read %d: %v", i, err)
+				}
+				if string(data) != dataStr(i) {
+					t.Fatalf("entry %d mismatch: %q != %q", i, data,
+						dataStr(i))
+				}
+			}
+			// The discarded bytes must be preserved as a truncation trace.
+			trace, err := ioutil.ReadFile(segPath + ".CORRUPT")
+			if err != nil {
+				t.Fatalf("expected corrupt trace: %v", err)
+			}
+			if !bytes.Equal(trace, torn) {
+				t.Fatalf("trace mismatch: %q != %q", trace, torn)
+			}
+			// The log remains writable and picks up from the recovered index.
+			if err := l.Write(last+1, []byte("recovered")); err != nil {
+				t.Fatal(err)
+			}
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestMiddleCorruptionNotSkipped(t *testing.T) {
+	for _, lf := range []LogFormat{Binary, JSON} {
+		name := "binary"
+		if lf == JSON {
+			name = "json"
+		}
+		t.Run(name, func(t *testing.T) {
+			logPath := "testlog/middle-corrupt-" + name
+			os.RemoveAll(logPath)
+			defer os.RemoveAll(logPath)
+			opts := makeOpts(256, true, lf, false)
+			l, err := Open(logPath, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := uint64(1); i <= 200; i++ {
+				if err := l.Write(i, []byte(dataStr(i))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(l.segments) < 2 {
+				t.Fatal("test setup expected multiple segments")
+			}
+			// Damage a sealed, non-tail segment: recovery must not silently
+			// skip the broken entries.
+			midPath := l.segments[0].path
+			mid, err := ioutil.ReadFile(midPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+			damaged := append([]byte{}, mid...)
+			if lf == JSON {
+				// A truncated final line is a torn-tail recoverable case.
+				// Corrupt an interior line instead so the segment is truly
+				// damaged in the middle and cannot be skipped.
+				nl := bytes.IndexByte(damaged, '\n')
+				if nl <= 0 {
+					t.Fatal("test setup expected a full first line")
+				}
+				for i := 0; i < nl; i++ {
+					damaged[i] = '{'
+				}
+			} else {
+				damaged = damaged[:len(damaged)/2]
+			}
+			if err := ioutil.WriteFile(midPath, damaged, 0666); err != nil {
+				t.Fatal(err)
+			}
+			// Reopen from disk: a damaged non-tail segment must surface as
+			// corruption instead of silently skipping entries.
+			l2, err := Open(logPath, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l2.Close()
+			first, err := l2.FirstIndex()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := l2.Read(first); err != ErrCorrupt {
+				t.Fatalf("expected %v when reading damaged segment, got %v",
+					ErrCorrupt, err)
+			}
+		})
+	}
+}
+
+func TestTailFullyTornRecovery(t *testing.T) {
+	for _, lf := range []LogFormat{Binary, JSON} {
+		name := "binary"
+		if lf == JSON {
+			name = "json"
+		}
+		t.Run(name, func(t *testing.T) {
+			logPath := "testlog/fully-torn-" + name
+			os.RemoveAll(logPath)
+			defer os.RemoveAll(logPath)
+			opts := makeOpts(4096, true, lf, true)
+			l, err := Open(logPath, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Only write a single entry, then simulate a torn write of the
+			// *next* one so the whole segment ends up unparseable past zero
+			// intact bytes. With AllowEmpty the log must reopen as empty.
+			if err := l.Write(1, []byte("first")); err != nil {
+				t.Fatal(err)
+			}
+			segPath := l.segments[len(l.segments)-1].path
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+			seg, err := ioutil.ReadFile(segPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Append a clearly partial record that cannot be the start of any
+			// valid frame and has no terminator.
+			torn := []byte{0xFF, 0xFF, 0xFF}
+			if lf == JSON {
+				torn = []byte(`{"index":"2","data":"+partial`)
+			}
+			if err := ioutil.WriteFile(segPath, append(seg, torn...), 0666); err != nil {
+				t.Fatal(err)
+			}
+			l, err = Open(logPath, opts)
+			if err != nil {
+				t.Fatalf("fully torn tail failed to open: %v", err)
+			}
+			defer l.Close()
+			if li, _ := l.LastIndex(); li != 1 {
+				t.Fatalf("expected last index 1, got %d", li)
+			}
+			if data, err := l.Read(1); err != nil || string(data) != "first" {
+				t.Fatalf("entry 1 lost: %q (%v)", data, err)
+			}
+			// Reopening again must be a no-op: no new trace, no error.
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+			l, err = Open(logPath, opts)
+			if err != nil {
+				t.Fatalf("second reopen failed: %v", err)
+			}
+			trace, err := ioutil.ReadFile(segPath + ".CORRUPT")
+			if err != nil {
+				t.Fatalf("expected trace file: %v", err)
+			}
+			if !bytes.Equal(trace, torn) {
+				t.Fatalf("trace mismatch: %q != %q", trace, torn)
+			}
+			if _, err := os.Stat(segPath + ".CORRUPT.1"); !os.IsNotExist(err) {
+				t.Fatalf("unexpected second trace file: %v", err)
+			}
+			// The log keeps working and a new torn write produces a numbered
+			// trace because .CORRUPT already exists.
+			if err := l.Write(2, []byte("second")); err != nil {
+				t.Fatal(err)
+			}
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+			seg2, err := ioutil.ReadFile(segPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			torn2 := []byte{0xFF, 0xFF, 0xFF}
+			if lf == JSON {
+				torn2 = []byte(`{"index":"3","data":"+half`)
+			}
+			if err := ioutil.WriteFile(segPath, append(seg2, torn2...), 0666); err != nil {
+				t.Fatal(err)
+			}
+			l, err = Open(logPath, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if li, _ := l.LastIndex(); li != 2 {
+				t.Fatalf("expected last index 2, got %d", li)
+			}
+			trace2, err := ioutil.ReadFile(segPath + ".CORRUPT.1")
+			if err != nil {
+				t.Fatalf("expected numbered trace: %v", err)
+			}
+			if !bytes.Equal(trace2, torn2) {
+				t.Fatalf("trace2 mismatch: %q != %q", trace2, torn2)
+			}
+			l.Close()
+		})
+	}
 }
 
 // https://github.com/tidwall/wal/issues/1

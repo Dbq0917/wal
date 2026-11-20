@@ -24,6 +24,12 @@ var (
 	// ErrCorrupt is returns when the log is corrupt.
 	ErrCorrupt = errors.New("log corrupt")
 
+	// errIncompleteEntry is returned while scanning a segment when the final
+	// record is only partially present, i.e. a torn trailing write. It is only
+	// tolerated at the tail of the log, where the partial record is truncated
+	// away during recovery.
+	errIncompleteEntry = errors.New("incomplete entry")
+
 	// ErrClosed is returned when an operation cannot be completed because
 	// the log is closed.
 	ErrClosed = errors.New("log closed")
@@ -282,7 +288,7 @@ func (l *Log) load() error {
 	l.firstIndex = l.segments[0].index
 	// Open the last segment for appending
 	lseg := l.segments[len(l.segments)-1]
-	l.sfile, err = os.OpenFile(lseg.path, os.O_WRONLY, l.opts.FilePerms)
+	l.sfile, err = os.OpenFile(lseg.path, os.O_RDWR, l.opts.FilePerms)
 	if err != nil {
 		return err
 	}
@@ -290,8 +296,18 @@ func (l *Log) load() error {
 		return err
 	}
 	// Load the last segment entries
-	if err := l.loadSegmentEntries(lseg); err != nil {
+	validLen, err := l.loadSegmentEntries(lseg, true)
+	if err != nil {
 		return err
+	}
+	if validLen < len(lseg.ebuf) {
+		// The tail segment ends with a partially written record, typically
+		// left behind by a crash or power loss mid-write. Preserve the torn
+		// bytes as evidence and truncate the segment back to the last intact
+		// record so the log can keep serving the valid prefix of entries.
+		if err := l.quarantineTail(lseg, validLen); err != nil {
+			return err
+		}
 	}
 	l.lastIndex = lseg.index + uint64(len(lseg.epos)) - 1
 	if l.lastIndex > 0 && l.firstIndex > l.lastIndex && !l.opts.AllowEmpty {
@@ -555,10 +571,19 @@ func (l *Log) findSegment(index uint64) int {
 	return i - 1
 }
 
-func (l *Log) loadSegmentEntries(s *segment) error {
+// loadSegmentEntries scans a segment file and records the byte positions of
+// every intact entry. It returns validLen, the number of bytes covered by
+// intact entries. When tail is true, a partially written record at the very
+// end of the segment is treated as a torn trailing write: the intact prefix
+// is kept and validLen is left short of the file size so the caller can
+// truncate the leftover bytes. Any other parse failure, including anything
+// encountered in a non-tail segment, returns ErrCorrupt rather than silently
+// skipping entries.
+func (l *Log) loadSegmentEntries(s *segment, tail bool) (validLen int,
+	err error) {
 	data, err := ioutil.ReadFile(s.path)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	ebuf := data
 	var epos []bpos
@@ -571,7 +596,14 @@ func (l *Log) loadSegmentEntries(s *segment) error {
 			n, err = loadNextBinaryEntry(data)
 		}
 		if err != nil {
-			return err
+			if tail && errors.Is(err, errIncompleteEntry) {
+				// A torn trailing record. Everything from pos to the end of
+				// the segment is discarded by the caller.
+				s.ebuf = ebuf
+				s.epos = epos
+				return pos, nil
+			}
+			return 0, ErrCorrupt
 		}
 		data = data[n:]
 		epos = append(epos, bpos{pos, pos + n})
@@ -579,6 +611,46 @@ func (l *Log) loadSegmentEntries(s *segment) error {
 	}
 	s.ebuf = ebuf
 	s.epos = epos
+	return pos, nil
+}
+
+// quarantineTail preserves the torn trailing bytes of a tail segment in a
+// sidecar file and truncates the segment back to the last intact record. The
+// sidecar keeps an on-disk trace of every recovery truncation instead of
+// silently dropping the partial write. validLen is the byte offset of the
+// first torn byte, i.e. the new segment size.
+func (l *Log) quarantineTail(s *segment, validLen int) error {
+	traceName := s.path + ".CORRUPT"
+	for i := 1; ; i++ {
+		if _, err := os.Stat(traceName); os.IsNotExist(err) {
+			break
+		} else if err != nil {
+			return err
+		}
+		traceName = fmt.Sprintf("%s.CORRUPT.%d", s.path, i)
+	}
+	f, err := os.OpenFile(traceName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
+		l.opts.FilePerms)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(s.ebuf[validLen:]); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := l.sfile.Truncate(int64(validLen)); err != nil {
+		return err
+	}
+	if _, err := l.sfile.Seek(int64(validLen), 0); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -586,7 +658,8 @@ func loadNextJSONEntry(data []byte) (n int, err error) {
 	// {"index":number,"data":string}
 	idx := bytes.IndexByte(data, '\n')
 	if idx == -1 {
-		return 0, ErrCorrupt
+		// A final line without its newline terminator is a torn write.
+		return 0, errIncompleteEntry
 	}
 	line := data[:idx]
 	dres := gjson.Get(*(*string)(unsafe.Pointer(&line)), "data")
@@ -600,10 +673,10 @@ func loadNextBinaryEntry(data []byte) (n int, err error) {
 	// data_size + data
 	size, n := binary.Uvarint(data)
 	if n <= 0 {
-		return 0, ErrCorrupt
+		return 0, errIncompleteEntry
 	}
 	if uint64(len(data)-n) < size {
-		return 0, ErrCorrupt
+		return 0, errIncompleteEntry
 	}
 	return n + int(size), nil
 }
@@ -633,7 +706,7 @@ func (l *Log) loadSegment(index uint64) (*segment, error) {
 	s := l.segments[idx]
 	if len(s.epos) == 0 {
 		// load the entries from cache
-		if err := l.loadSegmentEntries(s); err != nil {
+		if _, err := l.loadSegmentEntries(s, false); err != nil {
 			return nil, err
 		}
 	}
@@ -837,7 +910,7 @@ func (l *Log) truncateFront(index uint64) (err error) {
 	s.index = index
 	if segIdx == len(l.segments)-1 {
 		// Reopen the tail segment file
-		l.sfile, err = os.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms)
+		l.sfile, err = os.OpenFile(newName, os.O_RDWR, l.opts.FilePerms)
 		if err != nil {
 			return err
 		}
@@ -850,7 +923,7 @@ func (l *Log) truncateFront(index uint64) (err error) {
 			return err
 		}
 		// Load the last segment entries
-		if err = l.loadSegmentEntries(s); err != nil {
+		if _, err = l.loadSegmentEntries(s, false); err != nil {
 			return err
 		}
 	}
@@ -941,7 +1014,7 @@ func (l *Log) truncateBack(index uint64) (err error) {
 		return err
 	}
 	// Reopen the tail segment file
-	l.sfile, err = os.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms)
+	l.sfile, err = os.OpenFile(newName, os.O_RDWR, l.opts.FilePerms)
 	if err != nil {
 		return err
 	}
@@ -958,7 +1031,7 @@ func (l *Log) truncateBack(index uint64) (err error) {
 	l.segments = append([]*segment{}, l.segments[:segIdx+1]...)
 	l.lastIndex = index
 	l.clearCache()
-	if err = l.loadSegmentEntries(s); err != nil {
+	if _, err = l.loadSegmentEntries(s, false); err != nil {
 		return err
 	}
 	return nil
