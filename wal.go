@@ -62,6 +62,39 @@ const (
 	JSON LogFormat = 1
 )
 
+// PreAllocateMode selects how disk space is reserved for tail segments.
+// It trades on-disk footprint against append-write latency.
+type PreAllocateMode uint8
+
+const (
+	// PreAllocateDefault leaves the mode unset. It is normalized to
+	// PreAllocateIncremental when the log is opened.
+	PreAllocateDefault PreAllocateMode = iota
+	// PreAllocateNone never reserves space ahead of the data. The segment
+	// grows one write at a time, so the on-disk size always matches the
+	// amount of data written, but every growth point may incur a block
+	// allocation and an append-latency spike.
+	PreAllocateNone
+	// PreAllocateIncremental reserves space in fixed-size increments as the
+	// tail segment fills. The visible file size still tracks the real data,
+	// while the pre-reserved blocks absorb growth without per-write
+	// allocation latency. At most one increment of headroom is held, so the
+	// over-allocation is bounded by PreAllocateSize rather than by the whole
+	// segment size.
+	PreAllocateIncremental
+	// PreAllocateFull reserves a whole SegmentSize of blocks when a segment
+	// is created. Appends never block on allocation within a segment, but a
+	// half-written segment still occupies the full segment size on disk.
+	PreAllocateFull
+)
+
+// DefaultPreAllocateSize is the default reservation increment used by
+// PreAllocateIncremental. The increment is deliberately larger than a typical
+// write so fallocate runs only a handful of times per segment: each call is
+// cheap but not free, and reserving too often would reintroduce append
+// latency spikes while buying back little space.
+const DefaultPreAllocateSize = 4 << 20 // 4 MB
+
 // Options for Log
 type Options struct {
 	// NoSync disables fsync after writes. This is less durable and puts the
@@ -97,6 +130,14 @@ type Options struct {
 	// Perms represents the datafiles modes and permission bits
 	DirPerms  os.FileMode
 	FilePerms os.FileMode
+	// PreAllocate selects the disk reservation strategy for tail segments.
+	// A zero value (PreAllocateDefault) is treated as PreAllocateIncremental.
+	PreAllocate PreAllocateMode
+	// PreAllocateSize is the reservation increment for PreAllocateIncremental
+	// and the minimum reservation unit for PreAllocateFull. It is capped at
+	// SegmentSize; a non-positive value falls back to
+	// DefaultPreAllocateSize.
+	PreAllocateSize int
 }
 
 // DefaultOptions for Open().
@@ -109,6 +150,8 @@ var DefaultOptions = &Options{
 	AllowEmpty:       false,    // Do not allow empty log. 1+ entries required
 	DirPerms:         0750,     // Permissions for the created directories
 	FilePerms:        0640,     // Permissions for the created data files
+	PreAllocate:      PreAllocateIncremental,
+	PreAllocateSize:  DefaultPreAllocateSize,
 }
 
 // Log represents a write ahead log
@@ -132,6 +175,7 @@ type segment struct {
 	index uint64 // first index of segment
 	ebuf  []byte // cached entries buffer
 	epos  []bpos // cached entries positions in buffer
+	alloc int64  // bytes reserved on disk for the tail segment
 }
 
 type bpos struct {
@@ -155,6 +199,16 @@ func Open(path string, opts *Options) (*Log, error) {
 	}
 	if opts.FilePerms == 0 {
 		opts.FilePerms = DefaultOptions.FilePerms
+	}
+	if opts.PreAllocate == PreAllocateDefault {
+		opts.PreAllocate = DefaultOptions.PreAllocate
+	}
+	if opts.PreAllocateSize <= 0 {
+		opts.PreAllocateSize = DefaultOptions.PreAllocateSize
+	}
+	if opts.PreAllocateSize > opts.SegmentSize {
+		// It never makes sense to reserve more than a whole segment.
+		opts.PreAllocateSize = opts.SegmentSize
 	}
 
 	var err error
@@ -231,7 +285,10 @@ func (l *Log) load() error {
 		l.lastIndex = 0
 		l.sfile, err = os.OpenFile(l.segments[0].path,
 			os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
-		return err
+		if err != nil {
+			return err
+		}
+		return l.reserveTail(l.segments[0])
 	}
 	// Open existing log. Clean up log if START of END segments exists.
 	if startIdx != -1 {
@@ -293,6 +350,12 @@ func (l *Log) load() error {
 	if err := l.loadSegmentEntries(lseg); err != nil {
 		return err
 	}
+	// The reopened segment has no reserved headroom yet; initialize the
+	// watermark at the real data length and reserve ahead of the next append.
+	lseg.alloc = int64(len(lseg.ebuf))
+	if err := l.reserveTail(lseg); err != nil {
+		return err
+	}
 	l.lastIndex = lseg.index + uint64(len(lseg.epos)) - 1
 	if l.lastIndex > 0 && l.firstIndex > l.lastIndex && !l.opts.AllowEmpty {
 		return ErrEmptyLog
@@ -315,6 +378,15 @@ func (l *Log) Close() error {
 			return ErrCorrupt
 		}
 		return ErrClosed
+	}
+	// Release the tail's reserved headroom so a closed log occupies only its
+	// real data on disk. Reopening re-reserves ahead of the next append.
+	if l.opts.PreAllocate != PreAllocateNone {
+		tail := l.segments[len(l.segments)-1]
+		if err := l.sfile.Truncate(int64(len(tail.ebuf))); err != nil {
+			return err
+		}
+		tail.alloc = int64(len(tail.ebuf))
 	}
 	if err := l.sfile.Sync(); err != nil {
 		return err
@@ -356,6 +428,16 @@ func (l *Log) cycle() error {
 	if err := l.sfile.Sync(); err != nil {
 		return err
 	}
+	// Reclaim any reserved headroom in the segment being sealed. Reserved
+	// blocks only exist to smooth appends to the live tail; once a segment is
+	// sealed it will never grow again, so its on-disk size must equal its
+	// real data. Truncating here happens before the next segment's writes, so
+	// it never adds latency to an append.
+	prev := l.segments[len(l.segments)-1]
+	if err := l.sfile.Truncate(int64(len(prev.ebuf))); err != nil {
+		return err
+	}
+	prev.alloc = int64(len(prev.ebuf))
 	if err := l.sfile.Close(); err != nil {
 		return err
 	}
@@ -372,6 +454,42 @@ func (l *Log) cycle() error {
 		return err
 	}
 	l.segments = append(l.segments, s)
+	if err := l.reserveTail(s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// reserveTail ensures the tail segment has enough blocks reserved on disk to
+// absorb the next append without an allocation in the write path. The visible
+// file size is never extended past the real data, so reservation headroom
+// cannot be parsed as entries on reopen. A reservation failure is returned to
+// the caller only when the platform claims to support reservation but cannot
+// perform it; ordinary writes remain correct without reservation.
+func (l *Log) reserveTail(s *segment) error {
+	if l.opts.PreAllocate == PreAllocateNone {
+		return nil
+	}
+	dataSize := int64(len(s.ebuf))
+	var want int64
+	switch l.opts.PreAllocate {
+	case PreAllocateFull:
+		want = int64(l.opts.SegmentSize)
+	default:
+		// Incremental: keep one reservation increment of headroom.
+		inc := int64(l.opts.PreAllocateSize)
+		want = ((dataSize + inc) / inc) * inc
+	}
+	if want > int64(l.opts.SegmentSize) {
+		want = int64(l.opts.SegmentSize)
+	}
+	if want <= s.alloc {
+		return nil
+	}
+	if err := reserveSpace(l.sfile, s.alloc, want-s.alloc); err != nil {
+		return err
+	}
+	s.alloc = want
 	return nil
 }
 
@@ -476,6 +594,12 @@ func (l *Log) writeBatch(b *Batch) error {
 		var epos bpos
 		s.ebuf, epos = l.appendEntry(s.ebuf, b.entries[i].index, data)
 		s.epos = append(s.epos, epos)
+		// Make sure the blocks backing the new bytes are reserved before the
+		// write reaches the file, so the append never stalls on a growth
+		// allocation. The visible file size still equals len(s.ebuf).
+		if err := l.reserveTail(s); err != nil {
+			return err
+		}
 		if len(s.ebuf) >= l.opts.SegmentSize {
 			// segment has reached capacity, cycle now
 			if _, err := l.sfile.Write(s.ebuf[mark:]); err != nil {
@@ -849,6 +973,13 @@ func (l *Log) truncateFront(index uint64) (err error) {
 			err = errors.New("invalid seek")
 			return err
 		}
+		// The renamed segment only contains the surviving bytes, so any
+		// previously reserved headroom is gone. Reset the watermark and
+		// reserve ahead of the next append.
+		s.alloc = int64(len(ebuf))
+		if err = l.reserveTail(s); err != nil {
+			return err
+		}
 		// Load the last segment entries
 		if err = l.loadSegmentEntries(s); err != nil {
 			return err
@@ -958,6 +1089,12 @@ func (l *Log) truncateBack(index uint64) (err error) {
 	l.segments = append([]*segment{}, l.segments[:segIdx+1]...)
 	l.lastIndex = index
 	l.clearCache()
+	// The rebuilt segment contains only the surviving bytes; reset the
+	// reservation watermark before reserving headroom for new appends.
+	s.alloc = int64(len(ebuf))
+	if err = l.reserveTail(s); err != nil {
+		return err
+	}
 	if err = l.loadSegmentEntries(s); err != nil {
 		return err
 	}
