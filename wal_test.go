@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func dataStr(index uint64) string {
@@ -1341,4 +1342,192 @@ func TestIssue33(t *testing.T) {
 		t.Fatal(err)
 	}
 	l.Close()
+}
+
+// writeMixed appends a batch of entries and waits for durability, like
+// Write/WriteBatch do, but allocates indexes under the log lock so that
+// many goroutines can write concurrently without going out of order.
+func writeMixed(l *Log, n int, data []byte) error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return ErrClosed
+	}
+	var b Batch
+	base := l.lastIndex + 1
+	for i := 0; i < n; i++ {
+		b.Write(base+uint64(i), data)
+	}
+	if err := l.writeBatch(&b); err != nil {
+		l.mu.Unlock()
+		return err
+	}
+	l.mu.Unlock()
+	return l.syncWrite()
+}
+
+func TestMixedWriteGroupCommit(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+	l, err := Open("testlog", &Options{
+		SegmentSize: 4096, // small segments to exercise cycle under load
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const singleWriters = 8
+	const writesEach = 500
+	const batchRounds = 20 // the nightly batch job
+	const batchSize = 100
+
+	var wg sync.WaitGroup
+	errs := make(chan error, singleWriters+1)
+	start := time.Now()
+	for g := 0; g < singleWriters; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < writesEach; i++ {
+				if err := writeMixed(l, 1, []byte("single")); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < batchRounds; i++ {
+			if err := writeMixed(l, batchSize, []byte("batch")); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+
+	totalWrites := singleWriters*writesEach + batchRounds
+	totalEntries := singleWriters*writesEach + batchRounds*batchSize
+	syncs := atomic.LoadUint64(&l.syncs)
+	t.Logf("writes=%d entries=%d fsyncs=%d elapsed=%s throughput=%.0f writes/s",
+		totalWrites, totalEntries, syncs, elapsed,
+		float64(totalWrites)/elapsed.Seconds())
+	if syncs >= uint64(totalWrites) {
+		t.Fatalf("expected sync coalescing, got %d fsyncs for %d writes",
+			syncs, totalWrites)
+	}
+
+	// Every write was durable when it returned: all entries must be
+	// readable now and after a reopen.
+	lidx, err := l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lidx != uint64(totalEntries) {
+		t.Fatalf("expected last index %d, got %d", totalEntries, lidx)
+	}
+	for i := uint64(1); i <= lidx; i++ {
+		if _, err := l.Read(i); err != nil {
+			t.Fatalf("read index %d: %v", i, err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l, err = Open("testlog", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	lidx, err = l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lidx != uint64(totalEntries) {
+		t.Fatalf("expected last index %d after reopen, got %d",
+			totalEntries, lidx)
+	}
+	for i := uint64(1); i <= lidx; i++ {
+		if _, err := l.Read(i); err != nil {
+			t.Fatalf("read index %d after reopen: %v", i, err)
+		}
+	}
+}
+
+func TestMixedWriteReadback(t *testing.T) {
+	// Sequential mix of single and batch writes through the public API.
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+	l, err := Open("testlog", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var index uint64
+	var batch Batch
+	for round := 0; round < 100; round++ {
+		index++
+		if err := l.Write(index, []byte(dataStr(index))); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 10; i++ {
+			index++
+			batch.Write(index, []byte(dataStr(index)))
+		}
+		if err := l.WriteBatch(&batch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l, err = Open("testlog", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	lidx, err := l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lidx != index {
+		t.Fatalf("expected last index %d, got %d", index, lidx)
+	}
+	for i := uint64(1); i <= index; i++ {
+		data, err := l.Read(i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != dataStr(i) {
+			t.Fatalf("expected %q, got %q", dataStr(i), data)
+		}
+	}
+}
+
+func BenchmarkMixedWrite(b *testing.B) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+	l, err := Open("testlog", nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer l.Close()
+	data := []byte("benchmark-mixed-write-entry")
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := writeMixed(l, 1, data); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.StopTimer()
+	syncs := atomic.LoadUint64(&l.syncs)
+	b.ReportMetric(float64(syncs)/float64(b.N), "syncs/op")
 }

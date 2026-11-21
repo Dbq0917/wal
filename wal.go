@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 	"unsafe"
 
@@ -124,6 +125,21 @@ type Log struct {
 	sfile      *os.File    // tail segment file handle
 	wbatch     Batch       // reusable write batch
 	scache     tinylru.LRU // segment entries cache
+
+	// Group commit state. Writes are appended under mu, but the fsync
+	// that makes them durable happens outside of mu so that concurrent
+	// writers can share a single fsync. Durability is unchanged: a write
+	// only returns after an fsync covering it has completed.
+	writeGen  uint64     // incremented after each write when sync is required
+	syncMu    sync.Mutex // guards the fields below
+	syncCond  sync.Cond  // signaled when an in-flight fsync completes
+	syncing   bool       // an fsync is currently in flight
+	syncedGen uint64     // highest writeGen covered by a completed fsync
+	syncs     uint64     // total number of fsyncs performed
+
+	fmu   sync.Mutex // guards sfile handoff between writers and syncers
+	fcond sync.Cond  // signaled when the last sfile reference is released
+	srefs int        // in-flight fsyncs holding a reference to sfile
 }
 
 // segment represents a single segment file.
@@ -163,6 +179,8 @@ func Open(path string, opts *Options) (*Log, error) {
 		return nil, err
 	}
 	l := &Log{path: path, opts: *opts}
+	l.syncCond.L = &l.syncMu
+	l.fcond.L = &l.fmu
 	l.scache.Resize(l.opts.SegmentCacheSize)
 	if err := os.MkdirAll(path, l.opts.DirPerms); err != nil {
 		return nil, err
@@ -316,11 +334,27 @@ func (l *Log) Close() error {
 		}
 		return ErrClosed
 	}
-	if err := l.sfile.Sync(); err != nil {
-		return err
+	// Wait for in-flight group commit syncs to release the file, then
+	// sync and close it. The final sync covers every write appended so
+	// far, so mark it as such to release any pending sync waiters.
+	l.fmu.Lock()
+	for l.srefs > 0 {
+		l.fcond.Wait()
 	}
-	if err := l.sfile.Close(); err != nil {
-		return err
+	syncErr := l.sfile.Sync()
+	closeErr := l.sfile.Close()
+	l.fmu.Unlock()
+	if syncErr == nil {
+		l.syncMu.Lock()
+		l.syncedGen = atomic.LoadUint64(&l.writeGen)
+		l.syncCond.Broadcast()
+		l.syncMu.Unlock()
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	l.closed = true
 	if l.corrupt {
@@ -332,15 +366,21 @@ func (l *Log) Close() error {
 // Write an entry to the log.
 func (l *Log) Write(index uint64, data []byte) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.corrupt {
+		l.mu.Unlock()
 		return ErrCorrupt
 	} else if l.closed {
+		l.mu.Unlock()
 		return ErrClosed
 	}
 	l.wbatch.Clear()
 	l.wbatch.Write(index, data)
-	return l.writeBatch(&l.wbatch)
+	err := l.writeBatch(&l.wbatch)
+	l.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return l.syncWrite()
 }
 
 func (l *Log) appendEntry(dst []byte, index uint64, data []byte) (out []byte,
@@ -353,10 +393,19 @@ func (l *Log) appendEntry(dst []byte, index uint64, data []byte) (out []byte,
 
 // Cycle the old segment for a new segment.
 func (l *Log) cycle() error {
+	// Wait for in-flight group commit syncs to release the file, then
+	// sync, close, and swap it while holding fmu so that no syncer can
+	// grab the closed file in between.
+	l.fmu.Lock()
+	for l.srefs > 0 {
+		l.fcond.Wait()
+	}
 	if err := l.sfile.Sync(); err != nil {
+		l.fmu.Unlock()
 		return err
 	}
 	if err := l.sfile.Close(); err != nil {
+		l.fmu.Unlock()
 		return err
 	}
 	// cache the previous segment
@@ -365,12 +414,14 @@ func (l *Log) cycle() error {
 		index: l.lastIndex + 1,
 		path:  filepath.Join(l.path, segmentName(l.lastIndex+1)),
 	}
-	var err error
-	l.sfile, err = os.OpenFile(s.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC,
+	sfile, err := os.OpenFile(s.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC,
 		l.opts.FilePerms)
 	if err != nil {
+		l.fmu.Unlock()
 		return err
 	}
+	l.sfile = sfile
+	l.fmu.Unlock()
 	l.segments = append(l.segments, s)
 	return nil
 }
@@ -440,16 +491,23 @@ func (b *Batch) Clear() {
 // were added to the batch. The batch is cleared upon a successful return.
 func (l *Log) WriteBatch(b *Batch) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.corrupt {
+		l.mu.Unlock()
 		return ErrCorrupt
 	} else if l.closed {
+		l.mu.Unlock()
 		return ErrClosed
 	}
 	if len(b.entries) == 0 {
+		l.mu.Unlock()
 		return nil
 	}
-	return l.writeBatch(b)
+	err := l.writeBatch(b)
+	l.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return l.syncWrite()
 }
 
 func (l *Log) writeBatch(b *Batch) error {
@@ -497,12 +555,68 @@ func (l *Log) writeBatch(b *Batch) error {
 		l.lastIndex = b.entries[len(b.entries)-1].index
 	}
 	if !l.opts.NoSync {
-		if err := l.sfile.Sync(); err != nil {
-			return err
-		}
+		// The fsync is deferred to syncWrite so that it can be coalesced
+		// with the sync requests of other concurrent writers.
+		atomic.AddUint64(&l.writeGen, 1)
 	}
 	b.Clear()
 	return nil
+}
+
+// syncWrite makes the writes appended so far durable. Sync requests are
+// coalesced: writers that are waiting while an fsync is in flight are
+// covered by that fsync and return without triggering another one.
+func (l *Log) syncWrite() error {
+	if l.opts.NoSync {
+		return nil
+	}
+	gen := atomic.LoadUint64(&l.writeGen)
+	l.syncMu.Lock()
+	for {
+		if l.syncedGen >= gen {
+			// A completed fsync already covers this write.
+			l.syncMu.Unlock()
+			return nil
+		}
+		if l.syncing {
+			// Another writer is performing an fsync. Wait for it; it
+			// may cover this write too.
+			l.syncCond.Wait()
+			continue
+		}
+		l.syncing = true
+		l.syncMu.Unlock()
+		err := l.syncFile()
+		l.syncMu.Lock()
+		l.syncing = false
+		if err == nil {
+			l.syncedGen = gen
+		}
+		l.syncCond.Broadcast()
+		if err != nil {
+			l.syncMu.Unlock()
+			return err
+		}
+	}
+}
+
+// syncFile performs an fsync on the tail segment file. It runs outside of
+// l.mu, concurrently with writes, so it holds a reference to the file to
+// prevent cycle and Close from closing it mid-sync.
+func (l *Log) syncFile() error {
+	l.fmu.Lock()
+	f := l.sfile
+	l.srefs++
+	l.fmu.Unlock()
+	err := f.Sync()
+	atomic.AddUint64(&l.syncs, 1)
+	l.fmu.Lock()
+	l.srefs--
+	if l.srefs == 0 {
+		l.fcond.Broadcast()
+	}
+	l.fmu.Unlock()
+	return err
 }
 
 // FirstIndex returns the index of the first entry in the log.
@@ -974,7 +1088,15 @@ func (l *Log) Sync() error {
 	} else if l.closed {
 		return ErrClosed
 	}
-	return l.sfile.Sync()
+	if err := l.sfile.Sync(); err != nil {
+		return err
+	}
+	// This sync covers every write appended so far.
+	l.syncMu.Lock()
+	l.syncedGen = atomic.LoadUint64(&l.writeGen)
+	l.syncCond.Broadcast()
+	l.syncMu.Unlock()
+	return nil
 }
 
 // IsEmpty returns true if there are no entries in the log.
