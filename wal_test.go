@@ -666,6 +666,70 @@ func TestOutliers(t *testing.T) {
 		defer l.Close()
 		testFirstLast(t, l, firstIndex, 100, nil)
 	})
+
+	t.Run("recover-from-hole", func(t *testing.T) {
+		// A crash left a hole of zero bytes in the segment file. Recovery
+		// must skip the hole and not mistake it for the end of the log.
+		test := func(t *testing.T, lf LogFormat, hole int, atEnd bool) {
+			lpath := fmt.Sprintf("testlog/hole-%d-%d-%v", lf, hole, atEnd)
+			defer os.RemoveAll(lpath)
+			opts := makeOpts(32<<20, true, lf, false)
+			l := must(Open(lpath, opts)).(*Log)
+			const N = 100
+			for i := 1; i <= N; i++ {
+				must(nil, l.Write(uint64(i), []byte(dataStr(uint64(i)))))
+			}
+			seg := l.segments[len(l.segments)-1]
+			mid := seg.epos[N/2].pos
+			must(nil, l.Close())
+			// Splice a hole of zero bytes into the segment file.
+			data := must(ioutil.ReadFile(seg.path)).([]byte)
+			if atEnd {
+				data = append(data, make([]byte, hole)...)
+			} else {
+				tail := append([]byte{}, data[mid:]...)
+				data = append(data[:mid],
+					append(make([]byte, hole), tail...)...)
+			}
+			must(nil, ioutil.WriteFile(seg.path, data, 0666))
+			// Reopen and recover every entry, including the ones that
+			// follow the hole.
+			l = must(Open(lpath, opts)).(*Log)
+			dataOf := func(index uint64) []byte {
+				return []byte(dataStr(index))
+			}
+			testFirstLast(t, l, 1, uint64(N), dataOf)
+			if !atEnd {
+				// The skipped range is visible as a gap in the entry
+				// positions.
+				seg = l.segments[len(l.segments)-1]
+				gap := seg.epos[N/2].pos - seg.epos[N/2-1].end
+				if gap != hole {
+					t.Fatalf("expected %d, got %d", hole, gap)
+				}
+			}
+			// The log still accepts new entries after recovery.
+			must(nil, l.Write(uint64(N+1), []byte(dataStr(uint64(N+1)))))
+			must(nil, l.Close())
+			l = must(Open(lpath, opts)).(*Log)
+			defer l.Close()
+			testFirstLast(t, l, 1, uint64(N+1), dataOf)
+		}
+		t.Run("binary", func(t *testing.T) { test(t, Binary, 4096, false) })
+		t.Run("json", func(t *testing.T) { test(t, JSON, 4096, false) })
+		t.Run("binary-big-hole", func(t *testing.T) {
+			test(t, Binary, 16<<20, false)
+		})
+		t.Run("json-big-hole", func(t *testing.T) {
+			test(t, JSON, 16<<20, false)
+		})
+		t.Run("binary-tail", func(t *testing.T) {
+			test(t, Binary, 4096, true)
+		})
+		t.Run("json-tail", func(t *testing.T) {
+			test(t, JSON, 4096, true)
+		})
+	})
 }
 
 func makeOpts(segSize int, noSync bool, lf LogFormat, allowEmpty bool,

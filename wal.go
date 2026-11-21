@@ -565,7 +565,16 @@ func (l *Log) loadSegmentEntries(s *segment) error {
 	var pos int
 	for exidx := s.index; len(data) > 0; exidx++ {
 		var n int
-		if l.opts.LogFormat == JSON {
+		hole := data[0] == 0
+		if hole {
+			// A run of zero bytes is a hole left behind by a crash, such
+			// as an unflushed sparse region, and not the end of the log.
+			// Skip the run in bulk so that valid entries following the
+			// hole are still recovered. A run that reaches the end of
+			// the file is the true end of the log. Empty binary entries
+			// are indistinguishable from a one byte hole and are skipped.
+			n = holeSize(data)
+		} else if l.opts.LogFormat == JSON {
 			n, err = loadNextJSONEntry(data)
 		} else {
 			n, err = loadNextBinaryEntry(data)
@@ -574,12 +583,23 @@ func (l *Log) loadSegmentEntries(s *segment) error {
 			return err
 		}
 		data = data[n:]
-		epos = append(epos, bpos{pos, pos + n})
+		if !hole {
+			epos = append(epos, bpos{pos, pos + n})
+		}
 		pos += n
 	}
 	s.ebuf = ebuf
 	s.epos = epos
 	return nil
+}
+
+// holeSize returns the size of the run of zero bytes at the start of data.
+func holeSize(data []byte) int {
+	var n int
+	for n < len(data) && data[n] == 0 {
+		n++
+	}
+	return n
 }
 
 func loadNextJSONEntry(data []byte) (n int, err error) {
