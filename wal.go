@@ -62,6 +62,16 @@ const (
 	JSON LogFormat = 1
 )
 
+// String returns the name of the log format.
+func (lf LogFormat) String() string {
+	switch lf {
+	case JSON:
+		return "json"
+	default:
+		return "binary"
+	}
+}
+
 // Options for Log
 type Options struct {
 	// NoSync disables fsync after writes. This is less durable and puts the
@@ -124,6 +134,11 @@ type Log struct {
 	sfile      *os.File    // tail segment file handle
 	wbatch     Batch       // reusable write batch
 	scache     tinylru.LRU // segment entries cache
+
+	// Test-only fault injection hooks. All are nil during normal use.
+	testHookWrite func(p []byte) error
+	testHookSync  func() error
+	testHookCycle func() error
 }
 
 // segment represents a single segment file.
@@ -351,8 +366,10 @@ func (l *Log) appendEntry(dst []byte, index uint64, data []byte) (out []byte,
 	return appendBinaryEntry(dst, data)
 }
 
-// Cycle the old segment for a new segment.
-func (l *Log) cycle() error {
+// Cycle the old segment for a new segment. The nextIndex is the index of the
+// first entry that will be written to the new segment. This function never
+// touches lastIndex; index bookkeeping is the caller's responsibility.
+func (l *Log) cycle(nextIndex uint64) error {
 	if err := l.sfile.Sync(); err != nil {
 		return err
 	}
@@ -362,13 +379,21 @@ func (l *Log) cycle() error {
 	// cache the previous segment
 	l.pushCache(len(l.segments) - 1)
 	s := &segment{
-		index: l.lastIndex + 1,
-		path:  filepath.Join(l.path, segmentName(l.lastIndex+1)),
+		index: nextIndex,
+		path:  filepath.Join(l.path, segmentName(nextIndex)),
+	}
+	if l.testHookCycle != nil {
+		if err := l.testHookCycle(); err != nil {
+			return err
+		}
 	}
 	var err error
 	l.sfile, err = os.OpenFile(s.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC,
 		l.opts.FilePerms)
 	if err != nil {
+		// Remove any half-created segment file so it cannot be mistaken for
+		// a valid segment on a later reopen.
+		os.Remove(s.path)
 		return err
 	}
 	l.segments = append(l.segments, s)
@@ -438,6 +463,14 @@ func (b *Batch) Clear() {
 
 // WriteBatch writes the entries in the batch to the log in the order that they
 // were added to the batch. The batch is cleared upon a successful return.
+//
+// A batch is all-or-nothing: if any entry cannot be written, synced, or if a
+// segment rollover fails halfway through, every mutation made by the batch is
+// rolled back before returning the error. The in-memory buffers, the on-disk
+// segment files, the segment list, and lastIndex are all restored to their
+// state before the call, so retrying the same batch is safe and can neither
+// duplicate entries nor leave a gap. The rollback only records position
+// markers; it never copies the batch payload.
 func (l *Log) WriteBatch(b *Batch) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -452,18 +485,57 @@ func (l *Log) WriteBatch(b *Batch) error {
 	return l.writeBatch(b)
 }
 
-func (l *Log) writeBatch(b *Batch) error {
+func (l *Log) writeBatch(b *Batch) (err error) {
+	// Snapshot the pre-batch state as position markers. No entry payloads are
+	// copied; a failed batch is undone by slicing the buffers back to these
+	// lengths and, when a rollover happened, reopening and truncating the old
+	// tail file. The snapshot is taken before any mutation, including the
+	// sanity check below, so every error path rolls back to an identical
+	// state.
+	origLastIndex := l.lastIndex
+	origSegCount := len(l.segments)
+	origTail := l.segments[origSegCount-1]
+	origTailLen := len(origTail.ebuf)
+	origTailPos := len(origTail.epos)
+	cycled := false
+
+	rollback := func() error {
+		return l.rollbackBatch(origLastIndex, origSegCount, cycled, origTail,
+			origTailLen, origTailPos)
+	}
+	defer func() {
+		if v := recover(); v != nil {
+			l.corrupt = true
+			if rbErr := rollback(); rbErr != nil {
+				err = fmt.Errorf("%w: panic: %v; rollback: %v",
+					ErrCorrupt, v, rbErr)
+			} else {
+				err = fmt.Errorf("%w: panic: %v", ErrCorrupt, v)
+			}
+			return
+		}
+		if err != nil {
+			if rbErr := rollback(); rbErr != nil {
+				l.corrupt = true
+				err = fmt.Errorf("%w: %v; rollback failed: %v",
+					ErrCorrupt, err, rbErr)
+			}
+		}
+	}()
+
 	// check that all indexes in batch are sane
 	for i := 0; i < len(b.entries); i++ {
 		if b.entries[i].index != l.lastIndex+uint64(i+1) {
 			return ErrOutOfOrder
 		}
 	}
+
 	// load the tail segment
 	s := l.segments[len(l.segments)-1]
 	if len(s.ebuf) > l.opts.SegmentSize {
 		// tail segment has reached capacity. Close it and create a new one.
-		if err := l.cycle(); err != nil {
+		cycled = true
+		if err = l.cycle(l.lastIndex + 1); err != nil {
 			return err
 		}
 		s = l.segments[len(l.segments)-1]
@@ -478,11 +550,11 @@ func (l *Log) writeBatch(b *Batch) error {
 		s.epos = append(s.epos, epos)
 		if len(s.ebuf) >= l.opts.SegmentSize {
 			// segment has reached capacity, cycle now
-			if _, err := l.sfile.Write(s.ebuf[mark:]); err != nil {
+			if _, err = l.writeFile(s.ebuf[mark:]); err != nil {
 				return err
 			}
-			l.lastIndex = b.entries[i].index
-			if err := l.cycle(); err != nil {
+			cycled = true
+			if err = l.cycle(b.entries[i].index + 1); err != nil {
 				return err
 			}
 			s = l.segments[len(l.segments)-1]
@@ -491,17 +563,84 @@ func (l *Log) writeBatch(b *Batch) error {
 		datas = datas[b.entries[i].size:]
 	}
 	if len(s.ebuf)-mark > 0 {
-		if _, err := l.sfile.Write(s.ebuf[mark:]); err != nil {
+		if _, err = l.writeFile(s.ebuf[mark:]); err != nil {
 			return err
 		}
-		l.lastIndex = b.entries[len(b.entries)-1].index
 	}
 	if !l.opts.NoSync {
-		if err := l.sfile.Sync(); err != nil {
+		if l.testHookSync != nil {
+			if err = l.testHookSync(); err != nil {
+				return err
+			}
+		}
+		if err = l.sfile.Sync(); err != nil {
 			return err
 		}
 	}
+	// All bytes of every entry are on disk and synced. Only now advance the
+	// index, so lastIndex and the buffered/on-disk entries move together.
+	l.lastIndex = b.entries[len(b.entries)-1].index
 	b.Clear()
+	return nil
+}
+
+// writeFile appends p to the tail segment file. The testHookWrite hook allows
+// tests to simulate a failing write without breaking the real file handle.
+func (l *Log) writeFile(p []byte) (int, error) {
+	if l.testHookWrite != nil {
+		if err := l.testHookWrite(p); err != nil {
+			return 0, err
+		}
+	}
+	return l.sfile.Write(p)
+}
+
+// rollbackBatch undoes every mutation performed by a failed writeBatch call.
+// The markers describe the exact state before the batch started. Payload data
+// is never copied; buffers are merely re-sliced.
+func (l *Log) rollbackBatch(origLastIndex uint64, origSegCount int,
+	cycled bool,
+	origTail *segment, origTailLen, origTailPos int,
+) error {
+	l.lastIndex = origLastIndex
+
+	// Drop every segment the batch created. Their files have not been renamed
+	// into the committed segment set, so remove them from disk as well.
+	for i := origSegCount; i < len(l.segments); i++ {
+		if err := os.Remove(l.segments[i].path); err != nil &&
+			!os.IsNotExist(err) {
+			return err
+		}
+	}
+	l.segments = l.segments[:origSegCount]
+
+	// Restore the in-memory view of the original tail segment by slicing back
+	// to the pre-batch markers. This drops the batch's entries without moving
+	// any of the previously committed bytes.
+	origTail.ebuf = origTail.ebuf[:origTailLen]
+	origTail.epos = origTail.epos[:origTailPos]
+
+	// A rollover closes the original tail file handle regardless of whether
+	// the rollover itself succeeded, so whenever a rollover was attempted we
+	// must reopen the original tail. With no rollover the existing handle is
+	// still valid and only the truncation is needed.
+	if cycled {
+		if l.sfile != nil {
+			l.sfile.Close()
+		}
+		f, err := os.OpenFile(origTail.path, os.O_WRONLY,
+			l.opts.FilePerms)
+		if err != nil {
+			return err
+		}
+		l.sfile = f
+	}
+	if err := l.sfile.Truncate(int64(origTailLen)); err != nil {
+		return err
+	}
+	if _, err := l.sfile.Seek(int64(origTailLen), 0); err != nil {
+		return err
+	}
 	return nil
 }
 

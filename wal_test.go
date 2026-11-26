@@ -1342,3 +1342,267 @@ func TestIssue33(t *testing.T) {
 	}
 	l.Close()
 }
+
+// assertLogState verifies that the log's indexes are exactly first..last and
+// every readable entry still matches dataStr.
+func assertLogState(t *testing.T, l *Log, first, last uint64) {
+	t.Helper()
+	fi, err := l.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	li, err := l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi != first || li != last {
+		t.Fatalf("expected indexes %d..%d, got %d..%d", first, last, fi, li)
+	}
+	for i := first; i <= last; i++ {
+		data, err := l.Read(i)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if string(data) != dataStr(i) {
+			t.Fatalf("entry %d mismatch: %q != %q", i, data, dataStr(i))
+		}
+	}
+	if _, err := l.Read(last + 1); err != ErrNotFound {
+		t.Fatalf("expected ErrNotFound past the tail, got %v", err)
+	}
+}
+
+// segmentFiles returns the committed segment files (plain numeric names)
+// present in the log directory.
+func segmentFiles(t *testing.T, path string) []string {
+	t.Helper()
+	fis, err := ioutil.ReadDir(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, fi := range fis {
+		name := fi.Name()
+		if len(name) == 20 {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// TestWriteBatchRollback drives every failing step of writeBatch through the
+// test hooks and checks the all-or-nothing guarantee: after a failure the log
+// must be byte-for-byte identical (in memory and on disk) to its pre-batch
+// state, and retrying the same batch must succeed without duplicates or gaps.
+func TestWriteBatchRollback(t *testing.T) {
+	errBoom := errors.New("injected failure")
+
+	for _, lf := range []LogFormat{Binary, JSON} {
+		t.Run(lf.String(), func(t *testing.T) {
+			mkBatch := func(start uint64, n int) *Batch {
+				b := new(Batch)
+				for i := 0; i < n; i++ {
+					b.Write(start+uint64(i), []byte(dataStr(start+uint64(i))))
+				}
+				return b
+			}
+
+			// Failure point 1a: an in-loop flush fails with no segment
+			// rollover. Entries are already in the memory buffer but
+			// lastIndex must not move, so the retry cannot duplicate them.
+			t.Run("flush-fail-no-cycle", func(t *testing.T) {
+				path := "testlog/rollback-flush-" + lf.String()
+				os.RemoveAll(path)
+				opts := makeOpts(1<<20, false, lf, false)
+				l, err := Open(path, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer os.RemoveAll(path)
+				for i := uint64(1); i <= 20; i++ {
+					if err := l.Write(i, []byte(dataStr(i))); err != nil {
+						t.Fatal(err)
+					}
+				}
+				writes := 0
+				l.testHookWrite = func([]byte) error {
+					writes++
+					if writes == 1 {
+						return errBoom
+					}
+					return nil
+				}
+				b := mkBatch(21, 10)
+				if err := l.WriteBatch(b); !errors.Is(err, errBoom) {
+					t.Fatalf("expected injected error, got %v", err)
+				}
+				l.testHookWrite = nil
+				assertLogState(t, l, 1, 20)
+
+				// Retry the exact same batch, which the caller still holds.
+				if err := l.WriteBatch(b); err != nil {
+					t.Fatalf("retry failed: %v", err)
+				}
+				assertLogState(t, l, 1, 30)
+
+				if err := l.Close(); err != nil {
+					t.Fatal(err)
+				}
+				l2, err := Open(path, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer l2.Close()
+				assertLogState(t, l2, 1, 30)
+			})
+
+			// Failure point 1b: the final sync fails. Everything written by
+			// the batch must still be rolled back, including the disk bytes.
+			t.Run("sync-fail", func(t *testing.T) {
+				path := "testlog/rollback-sync-" + lf.String()
+				os.RemoveAll(path)
+				opts := makeOpts(1<<20, false, lf, false)
+				l, err := Open(path, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer os.RemoveAll(path)
+				for i := uint64(1); i <= 10; i++ {
+					if err := l.Write(i, []byte(dataStr(i))); err != nil {
+						t.Fatal(err)
+					}
+				}
+				l.testHookSync = func() error { return errBoom }
+				b := mkBatch(11, 5)
+				if err := l.WriteBatch(b); !errors.Is(err, errBoom) {
+					t.Fatalf("expected injected error, got %v", err)
+				}
+				l.testHookSync = nil
+				assertLogState(t, l, 1, 10)
+
+				if err := l.WriteBatch(b); err != nil {
+					t.Fatalf("retry failed: %v", err)
+				}
+				assertLogState(t, l, 1, 15)
+
+				if err := l.Close(); err != nil {
+					t.Fatal(err)
+				}
+				l2, err := Open(path, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer l2.Close()
+				assertLogState(t, l2, 1, 15)
+			})
+
+			// Failure point 2a: the mid-batch rollover fails after the full
+			// segment was flushed. lastIndex must not have been advanced to
+			// the rolled-over entry, otherwise the next write would start
+			// past a gap.
+			t.Run("mid-batch-cycle-fail", func(t *testing.T) {
+				path := "testlog/rollback-cycle-" + lf.String()
+				os.RemoveAll(path)
+				opts := makeOpts(256, false, lf, false)
+				l, err := Open(path, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer os.RemoveAll(path)
+				for i := uint64(1); i <= 15; i++ {
+					if err := l.Write(i, []byte(dataStr(i))); err != nil {
+						t.Fatal(err)
+					}
+				}
+				segBefore := len(l.segments)
+				l.testHookCycle = func() error { return errBoom }
+				b := mkBatch(16, 25)
+				if err := l.WriteBatch(b); !errors.Is(err, errBoom) {
+					t.Fatalf("expected injected error, got %v", err)
+				}
+				l.testHookCycle = nil
+				assertLogState(t, l, 1, 15)
+				if len(l.segments) != segBefore {
+					t.Fatalf("segment list not rolled back: %d != %d",
+						len(l.segments), segBefore)
+				}
+
+				// No half-created segment files may linger on disk.
+				if names := segmentFiles(t, path); len(names) != segBefore {
+					t.Fatalf("expected %d segment files, got %d: %v",
+						segBefore, len(names), names)
+				}
+
+				// Retry from index 16: no gap, no duplicate.
+				if err := l.WriteBatch(b); err != nil {
+					t.Fatalf("retry failed: %v", err)
+				}
+				assertLogState(t, l, 1, 40)
+
+				if err := l.Close(); err != nil {
+					t.Fatal(err)
+				}
+				l2, err := Open(path, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer l2.Close()
+				assertLogState(t, l2, 1, 40)
+			})
+
+			// Failure point 2b: a rollover is required before the first
+			// entry is appended (tail already at capacity). The failed cycle
+			// must be fully undone and the old tail reopened for appending.
+			t.Run("pre-batch-cycle-fail", func(t *testing.T) {
+				path := "testlog/rollback-precycle-" + lf.String()
+				os.RemoveAll(path)
+				opts := makeOpts(1<<20, false, lf, false)
+				l, err := Open(path, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer os.RemoveAll(path)
+				for i := uint64(1); i <= 8; i++ {
+					if err := l.Write(i, []byte(dataStr(i))); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// Shrink the target so the existing tail is already over
+				// capacity and the next batch must roll over before its first
+				// append, while no rollover happened while filling the log
+				// (the large initial target keeps it in a single segment).
+				l.opts.SegmentSize = 32
+				tail := l.segments[len(l.segments)-1]
+				if len(tail.ebuf) <= l.opts.SegmentSize {
+					t.Fatalf("test setup: tail not over capacity")
+				}
+				segBefore := len(l.segments)
+				l.testHookCycle = func() error { return errBoom }
+				b := mkBatch(9, 4)
+				if err := l.WriteBatch(b); !errors.Is(err, errBoom) {
+					t.Fatalf("expected injected error, got %v", err)
+				}
+				l.testHookCycle = nil
+				assertLogState(t, l, 1, 8)
+				if len(l.segments) != segBefore {
+					t.Fatalf("segment list not rolled back")
+				}
+
+				if err := l.WriteBatch(b); err != nil {
+					t.Fatalf("retry failed: %v", err)
+				}
+				assertLogState(t, l, 1, 12)
+
+				if err := l.Close(); err != nil {
+					t.Fatal(err)
+				}
+				l2, err := Open(path, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer l2.Close()
+				assertLogState(t, l2, 1, 12)
+			})
+		})
+	}
+}
