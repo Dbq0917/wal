@@ -122,7 +122,6 @@ type Log struct {
 	firstIndex uint64      // index of the first entry in log
 	lastIndex  uint64      // index of the last entry in log
 	sfile      *os.File    // tail segment file handle
-	wbatch     Batch       // reusable write batch
 	scache     tinylru.LRU // segment entries cache
 }
 
@@ -338,9 +337,44 @@ func (l *Log) Write(index uint64, data []byte) error {
 	} else if l.closed {
 		return ErrClosed
 	}
-	l.wbatch.Clear()
-	l.wbatch.Write(index, data)
-	return l.writeBatch(&l.wbatch)
+	if index != l.lastIndex+1 {
+		return ErrOutOfOrder
+	}
+
+	s := l.segments[len(l.segments)-1]
+	if len(s.ebuf) > l.opts.SegmentSize {
+		// tail segment has reached capacity. Close it and create a new one.
+		if err := l.cycle(); err != nil {
+			return err
+		}
+		s = l.segments[len(l.segments)-1]
+	}
+
+	mark := len(s.ebuf)
+	var epos bpos
+	s.ebuf, epos = l.appendEntry(s.ebuf, index, data)
+	s.epos = append(s.epos, epos)
+	if len(s.ebuf) >= l.opts.SegmentSize {
+		// segment has reached capacity, cycle now
+		if _, err := l.sfile.Write(s.ebuf[mark:]); err != nil {
+			return err
+		}
+		l.lastIndex = index
+		if err := l.cycle(); err != nil {
+			return err
+		}
+	} else if len(s.ebuf)-mark > 0 {
+		if _, err := l.sfile.Write(s.ebuf[mark:]); err != nil {
+			return err
+		}
+		l.lastIndex = index
+	}
+	if !l.opts.NoSync {
+		if err := l.sfile.Sync(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (l *Log) appendEntry(dst []byte, index uint64, data []byte) (out []byte,
