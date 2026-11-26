@@ -6,6 +6,8 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -665,6 +667,48 @@ func TestOutliers(t *testing.T) {
 		l = must(Open(lpath, opts)).(*Log)
 		defer l.Close()
 		testFirstLast(t, l, firstIndex, 100, nil)
+	})
+
+	t.Run("end-marker-file", func(t *testing.T) {
+		lpath := "testlog/end-marker"
+		defer os.RemoveAll(lpath)
+		opts := makeOpts(512, true, JSON, false)
+		l := must(Open(lpath, opts)).(*Log)
+		for i := uint64(1); i <= 100; i++ {
+			must(nil, l.Write(i, []byte(dataStr(i))))
+		}
+		must(nil, l.Close())
+
+		fis, err := ioutil.ReadDir(lpath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, fi := range fis {
+			if len(fi.Name()) == 20 {
+				names = append(names, fi.Name())
+			}
+		}
+		if len(names) < 3 {
+			t.Fatalf("expected at least 3 segments, got %d", len(names))
+		}
+		i := len(names) / 2
+		path := filepath.Join(lpath, names[i])
+		data := must(ioutil.ReadFile(path)).([]byte)
+		nextIndex, err := strconv.ParseUint(names[i+1], 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastIndex := nextIndex - 1
+		must(nil, ioutil.WriteFile(path+".END", data, 0666))
+
+		l = must(Open(lpath, opts)).(*Log)
+		testFirstLast(t, l, 1, lastIndex, nil)
+		must(nil, l.Close())
+
+		l = must(Open(lpath, opts)).(*Log)
+		defer l.Close()
+		testFirstLast(t, l, 1, lastIndex, nil)
 	})
 }
 

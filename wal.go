@@ -180,6 +180,18 @@ func abs(path string) (string, error) {
 	return filepath.Abs(path)
 }
 
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	err = dir.Sync()
+	if closeErr := dir.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
 func (l *Log) pushCache(segIdx int) {
 	_, _, _, v, evicted :=
 		l.scache.SetEvicted(segIdx, l.segments[segIdx])
@@ -245,12 +257,18 @@ func (l *Log) load() error {
 				return err
 			}
 		}
+		if err := syncDir(l.path); err != nil {
+			return err
+		}
 		l.segments = append([]*segment{}, l.segments[startIdx:]...)
 		// Rename the START segment
 		orgPath := l.segments[0].path
 		finalPath := orgPath[:len(orgPath)-len(".START")]
 		err := os.Rename(orgPath, finalPath)
 		if err != nil {
+			return err
+		}
+		if err := syncDir(l.path); err != nil {
 			return err
 		}
 		l.segments[0].path = finalPath
@@ -261,6 +279,9 @@ func (l *Log) load() error {
 			if err := os.Remove(l.segments[i].path); err != nil {
 				return err
 			}
+		}
+		if err := syncDir(l.path); err != nil {
+			return err
 		}
 		l.segments = append([]*segment{}, l.segments[:endIdx+1]...)
 		if len(l.segments) > 1 && l.segments[len(l.segments)-2].index ==
@@ -275,6 +296,9 @@ func (l *Log) load() error {
 		finalPath := orgPath[:len(orgPath)-len(".END")]
 		err := os.Rename(orgPath, finalPath)
 		if err != nil {
+			return err
+		}
+		if err := syncDir(l.path); err != nil {
 			return err
 		}
 		l.segments[len(l.segments)-1].path = finalPath
